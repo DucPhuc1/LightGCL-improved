@@ -70,6 +70,7 @@ class LightGCL(nn.Module):
         self.vt = vt
 
         # GraphAug-view params (Option B: observed edges + sampled 2-hop candidates)
+        # obs_u/obs_i and twohop_u/twohop_i are 1D Long tensors on GPU.
         self.obs_u = obs_u
         self.obs_i = obs_i
         self.twohop_u = twohop_u
@@ -126,11 +127,29 @@ class LightGCL(nn.Module):
                 self.G_u = sum(self.G_u_list)
                 self.G_i = sum(self.G_i_list)
             else:
+                # GraphAug view2: observed edges + sampled 2-hop candidates.
+                # Stop-gradient: detach embeddings used by the augmentor.
+                # IMPORTANT: torch.spmm does NOT support backprop w.r.t. sparse values.
+                # Since A' edge weights are produced by the augmentor and require gradients,
+                # we implement message passing using edge lists (index_add), which supports
+                # gradients w.r.t. edge weights.
                 u_all, i_all, v_norm = self._build_graphaug_view2_edges(
                     self.E_u.detach(),
                     self.E_i.detach(),
                 )
 
+                # IMPORTANT (LightGCL-style View2):
+                # In the original LightGCL, the auxiliary (SVD) view at layer `l` is computed
+                # from the *main-view embeddings at layer l-1* (E_{l-1}), not by recursively
+                # propagating within the auxiliary view itself.
+                #
+                # To keep the workflow consistent, we compute:
+                #   G_l = A' @ E_{l-1}
+                # rather than:
+                #   G_l = A' @ G_{l-1}
+                #
+                # This typically improves stability and reduces view mismatch that can
+                # degrade Recall/NDCG.
                 self.G_u_list = [None] * (self.l + 1)
                 self.G_i_list = [None] * (self.l + 1)
                 self.G_u_list[0] = self.E_u_0
@@ -148,33 +167,17 @@ class LightGCL(nn.Module):
                 self.G_u = sum(self.G_u_list)
                 self.G_i = sum(self.G_i_list)
 
-            # -------------------------
-            # DirectAU Loss (Replaces InfoNCE)
-            # -------------------------
-            # 1. Normalize embeddings to the unit hypersphere (L2 normalization)
-            G_u_norm = F.normalize(self.G_u, p=2, dim=1)
-            E_u_norm = F.normalize(self.E_u, p=2, dim=1)
-            G_i_norm = F.normalize(self.G_i, p=2, dim=1)
-            E_i_norm = F.normalize(self.E_i, p=2, dim=1)
+            # cl loss
+            G_u_norm = self.G_u
+            E_u_norm = self.E_u
+            G_i_norm = self.G_i
+            E_i_norm = self.E_i
+            neg_score = torch.log(torch.exp(G_u_norm[uids] @ E_u_norm.T / self.temp).sum(1) + 1e-8).mean()
+            neg_score += torch.log(torch.exp(G_i_norm[iids] @ E_i_norm.T / self.temp).sum(1) + 1e-8).mean()
+            pos_score = (torch.clamp((G_u_norm[uids] * E_u_norm[uids]).sum(1) / self.temp,-5.0,5.0)).mean() + (torch.clamp((G_i_norm[iids] * E_i_norm[iids]).sum(1) / self.temp,-5.0,5.0)).mean()
+            loss_s = -pos_score + neg_score
 
-            # 2. Alignment Loss (Distance between positive views)
-            align_u = (G_u_norm[uids] - E_u_norm[uids]).norm(p=2, dim=1).pow(2).mean()
-            align_i = (G_i_norm[iids] - E_i_norm[iids]).norm(p=2, dim=1).pow(2).mean()
-            loss_align = align_u + align_i
-
-            # 3. Uniformity Loss (Pushing batch nodes apart to avoid collapse)
-            t = 2.0  # Hyperparameter controlling uniformity strength
-            uniform_u = torch.pdist(E_u_norm[uids], p=2).pow(2).mul(-t).exp().mean().log()
-            uniform_i = torch.pdist(E_i_norm[iids], p=2).pow(2).mul(-t).exp().mean().log()
-            loss_uniform = uniform_u + uniform_i
-
-            # 4. Combine Alignment and Uniformity for final SSL loss
-            gamma = 1.0  # Weight for Uniformity
-            loss_s = loss_align + gamma * loss_uniform
-
-            # -------------------------
-            # BPR Loss (Recommendation Task)
-            # -------------------------
+            # bpr loss
             u_emb = self.E_u[uids]
             pos_emb = self.E_i[pos]
             neg_emb = self.E_i[neg]
@@ -182,19 +185,35 @@ class LightGCL(nn.Module):
             neg_scores = (u_emb * neg_emb).sum(-1)
             loss_r = -(pos_scores - neg_scores).sigmoid().log().mean()
 
-            # -------------------------
-            # Reg Loss (Weight Decay)
-            # -------------------------
+            # reg loss
             loss_reg = 0
             for param in self.parameters():
                 loss_reg += param.norm(2).square()
             loss_reg *= self.lambda_2
 
-            # Total loss
+            # total loss
             loss = loss_r + self.lambda_1 * loss_s + loss_reg
+            #print('loss',loss.item(),'loss_r',loss_r.item(),'loss_s',loss_s.item())
             return loss, loss_r, self.lambda_1 * loss_s
 
     def _build_graphaug_view2_edges(self, E_u_detached: torch.Tensor, E_i_detached: torch.Tensor):
+        """Build *edge lists* for view2 using:
+        A' = observed_edges (weight=1) U sampled_twohop_edges (weight=soft_sample, thresholded).
+
+        Returns:
+            u_all: LongTensor [E] user indices
+            i_all: LongTensor [E] item indices
+            v_norm: FloatTensor [E] normalized edge weights (requires grad for 2-hop part)
+
+        Notes:
+            We intentionally avoid constructing a sparse tensor A' because torch.spmm
+            does not support gradients w.r.t. sparse values. Using edge lists + index_add
+            supports gradients w.r.t. v_norm, enabling the augmentor to learn.
+
+        - Option B: observed edges + sampled 2-hop candidates.
+        - Density control: threshold xi.
+        - Stop-gradient: caller passes detached embeddings.
+        """
         assert self.obs_u is not None and self.obs_i is not None, 'obs_u/obs_i must be provided for graphaug view2'
         assert self.twohop_u is not None and self.twohop_i is not None, 'twohop_u/twohop_i must be provided for graphaug view2'
 
@@ -205,6 +224,7 @@ class LightGCL(nn.Module):
         p = torch.sigmoid(logits).clamp(1e-6, 1 - 1e-6)
 
         # Gumbel-sigmoid (Concrete) sampling
+        # g = -log(-log(u))
         u = torch.rand_like(p)
         g = -torch.log(-torch.log(u + 1e-8) + 1e-8)
         logit_p = torch.log(p) - torch.log(1 - p)
@@ -239,6 +259,16 @@ class LightGCL(nn.Module):
         i_idx: torch.Tensor,
         w: torch.Tensor,
     ):
+        """One LightGCN-style propagation step on a bipartite graph defined by edge lists.
+
+        E_u_next[u] = sum_{(u,i) in E} w(u,i) * E_i_prev[i]
+        E_i_next[i] = sum_{(u,i) in E} w(u,i) * E_u_prev[u]
+
+        This is equivalent to:
+            E_u_next = A' @ E_i_prev
+            E_i_next = A'^T @ E_u_prev
+        but implemented with index_add so gradients can flow through w.
+        """
         n_u, d = E_u_prev.shape
         n_i = E_i_prev.shape[0]
 
